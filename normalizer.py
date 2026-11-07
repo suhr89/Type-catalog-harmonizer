@@ -340,6 +340,16 @@ def enforce_schema_and_collision_safeguards(
         if str(proposed_col).strip():
             register_master_col(str(proposed_col).strip())
 
+    # Ensure 'Brand' is always present in master_columns (Brand Fallback rule)
+    if "brand" not in master_lower_map:
+        # Insert after UPC/SKU if present, else append
+        insert_pos = len(master_columns)
+        for idx, col in enumerate(master_columns):
+            if col.lower() in {"sku", "upc", "gtin", "barcode"}:
+                insert_pos = idx + 1
+        master_columns.insert(insert_pos, "Brand")
+        master_lower_map["brand"] = "Brand"
+
     raw_file_mappings = raw_plan.get("file_mappings", {})
     if not isinstance(raw_file_mappings, dict):
         raw_file_mappings = {}
@@ -804,10 +814,163 @@ def _resolve_categorical_transform_dict(
     return raw_map
 
 
+_FILENAME_STOPWORDS = {
+    "vendor",
+    "supplier",
+    "partner",
+    "catalog",
+    "catalogue",
+    "inventory",
+    "products",
+    "product",
+    "items",
+    "item",
+    "sheet",
+    "list",
+    "price",
+    "pricelist",
+    "data",
+    "export",
+    "harmonized",
+    "normalized",
+    "raw",
+    "sample",
+    "test",
+    "file",
+    "feed",
+}
+
+_GENERIC_SPEC_TOKENS = {
+    "led",
+    "cfl",
+    "hid",
+    "incandescent",
+    "halogen",
+    "bulb",
+    "lamp",
+    "light",
+    "tube",
+    "fixture",
+    "a19",
+    "a21",
+    "br30",
+    "br40",
+    "par20",
+    "par30",
+    "par38",
+    "mr16",
+    "t8",
+    "t5",
+    "g25",
+    "st19",
+    "b10",
+    "b11",
+}
+
+
+def derive_brand_fallback(source_filename: str | None, titles: list[str]) -> str:
+    """Derive a clean Brand name from the filename or common title prefix when a file lacks a Brand column.
+
+    Examples:
+        - `vendor_apex.xlsx` -> `"Apex"`
+        - `vendor_lumencraft.xlsx` (with titles starting with `"LumenCraft"`) -> `"LumenCraft"`
+    """
+    # 1. Inspect common first-word prefix across non-empty product titles
+    first_words: list[str] = []
+    for t in titles:
+        t_clean = str(t).strip()
+        if not t_clean:
+            continue
+        token = re.split(r"[\s\-–—:|/]+", t_clean)[0]
+        if token and token.lower() not in _GENERIC_SPEC_TOKENS and not re.match(r"^\d", token):
+            first_words.append(token)
+
+    common_title_prefix = ""
+    if first_words:
+        counts: dict[str, int] = {}
+        canonical_casing: dict[str, str] = {}
+        for w in first_words:
+            w_low = w.lower()
+            counts[w_low] = counts.get(w_low, 0) + 1
+            canonical_casing.setdefault(w_low, w)
+        best_low, best_count = max(counts.items(), key=lambda kv: kv[1])
+        if best_count >= max(1, int(len(first_words) * 0.6)):
+            common_title_prefix = canonical_casing[best_low]
+
+    # 2. Extract candidate brand tokens from source_filename
+    filename_brand = ""
+    if source_filename:
+        stem = Path(source_filename).stem
+        tokens = [
+            tok
+            for tok in re.split(r"[_\-\s.]+", stem)
+            if tok
+            and tok.lower() not in _FILENAME_STOPWORDS
+            and not tok.isdigit()
+            and not re.match(r"^v\d+$", tok.lower())
+        ]
+        if tokens:
+            joined_low = "".join(tokens).lower()
+            if common_title_prefix and common_title_prefix.lower() == joined_low:
+                return common_title_prefix
+            if len(tokens) == 1 and common_title_prefix and common_title_prefix.lower() == tokens[0].lower():
+                return common_title_prefix
+            filename_brand = " ".join(
+                tok if ( any(c.isupper() for c in tok[1:]) or tok.isupper() ) else tok.capitalize()
+                for tok in tokens
+            )
+
+    return filename_brand or common_title_prefix
+
+
+def strip_brand_from_title(title: str, row_brand: str, vendor_root_brand: str = "") -> str:
+    """Remove the brand name (and any sub-brand or vendor root name) from the start of a product title.
+
+    Examples:
+        - Brand='Apex', Title='Apex A19 Everyday LED Bulb' -> 'A19 Everyday LED Bulb'
+        - Brand='LumenCraft Pro', Title='LumenCraft Pro A19 Omni LED' -> 'A19 Omni LED'
+        - Brand='LumenCraft Pro', Title='LumenCraft Recessed BR30 Flood' -> 'Recessed BR30 Flood'
+    """
+    cleaned_title = str(title).strip()
+    if not cleaned_title:
+        return ""
+
+    candidates: list[str] = []
+    for raw_cand in (row_brand, vendor_root_brand):
+        c = str(raw_cand).strip()
+        if c and c not in candidates:
+            candidates.append(c)
+        # Also include the root/first word of a multi-word brand (e.g. "LumenCraft" from "LumenCraft Pro")
+        parts = c.split()
+        if len(parts) > 1 and len(parts[0]) >= 3 and parts[0] not in candidates:
+            candidates.append(parts[0])
+
+    # Sort longest candidate first so "LumenCraft Pro" matches before "LumenCraft"
+    candidates.sort(key=len, reverse=True)
+
+    for _ in range(2):
+        matched = False
+        for cand in candidates:
+            pattern = re.compile(
+                r"^" + re.escape(cand) + r"(?:\b|(?=\s|[-–—:|/]))[\s\-–—:|/]*",
+                 flags=re.IGNORECASE,
+            )
+            new_title = pattern.sub("", cleaned_title, count=1).strip()
+            if new_title and new_title != cleaned_title:
+                cleaned_title = new_title
+                matched = True
+                break
+        if not matched:
+            break
+
+    return cleaned_title
+
+
 def normalize_vendor_dataframe(
     df: pd.DataFrame,
     file_mapping: dict[str, str],
     synthesis_plan: dict[str, Any],
+    source_filename: str | None = None,
 ) -> tuple[pd.DataFrame, set[tuple[int, str]]]:
     """Transform a raw vendor DataFrame into the Master Schema layout.
 
@@ -877,6 +1040,44 @@ def normalize_vendor_dataframe(
                 transformed_col.append(raw_str)
 
         output_data[master_col] = transformed_col
+
+    # -----------------------------------------------------------------------
+    # Linked Rules: Brand Fallback & Title Brand Stripping
+    # -----------------------------------------------------------------------
+    brand_col = next(
+        (c for c in master_columns if c.lower() in {"brand", "manufacturer", "vendor", "make"}),
+        None,
+    )
+    title_col = next(
+        (
+            c
+            for c in master_columns
+            if c.lower() in {"product_title", "title", "product_name", "item_description", "item_name"}
+        ),
+        None,
+    )
+
+    raw_titles = [str(v) for v in output_data.get(title_col, [])] if title_col else []
+    fallback_brand = derive_brand_fallback(source_filename, raw_titles)
+
+    if brand_col:
+        brand_series = output_data[brand_col]
+        for row_idx in range(num_rows):
+            if not str(brand_series[row_idx]).strip() and fallback_brand:
+                brand_series[row_idx] = fallback_brand
+
+    if title_col:
+        title_series = output_data[title_col]
+        brand_series = output_data[brand_col] if brand_col else [fallback_brand] * num_rows
+        for row_idx in range(num_rows):
+            current_title = str(title_series[row_idx]).strip()
+            if current_title:
+                row_brand = str(brand_series[row_idx]).strip() or fallback_brand
+                title_series[row_idx] = strip_brand_from_title(
+                    title=current_title,
+                    row_brand=row_brand,
+                    vendor_root_brand=fallback_brand,
+                )
 
     normalized_df = pd.DataFrame(output_data, columns=master_columns)
     return normalized_df, flagged_cells
@@ -992,6 +1193,7 @@ def process_batch_to_zip(
                 df=df,
                 file_mapping=file_map,
                 synthesis_plan=synthesis_plan,
+                source_filename=original_filename,
             )
             xlsx_bytes = write_standardized_excel_bytes(
                 normalized_df=norm_df,
